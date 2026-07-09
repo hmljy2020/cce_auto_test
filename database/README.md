@@ -1,11 +1,9 @@
 # Database Format
 
-The first database version is intentionally minimal. It keeps one current result
-for each unique benchmark case.
+The database stores one current successful result for each unique benchmark
+case.
 
-## Core Table
-
-Use one core table:
+## Measurements Table
 
 ```sql
 CREATE TABLE measurements (
@@ -34,98 +32,36 @@ CREATE TABLE measurements (
 );
 ```
 
-## Unique Case Identity
+## Case Identity
 
-One row represents one unique benchmark case and its current result.
+The unique case identity is `arch_version`, `soc_version`, `cce_name`,
+`signature`, `cce_args_json`, and `extra_params_json`. Re-testing the same case
+overwrites `template_id`, `time_ns`, and `updated_at`.
 
-The unique case identity is:
+`arch_version` and `soc_version` are plain text. `device_id` and `cann_version`
+are not stored.
 
-```text
-arch_version
-soc_version
-cce_name
-signature
-cce_args_json
-extra_params_json
-```
+## Signature Fields
 
-The following fields do not participate in case identity:
+`cce_name` must exactly match `metadata.instruction`. `signature` must exactly
+match one `metadata.overloads[].signature`; database writers must copy it
+without reformatting.
 
-```text
-template_id
-time_ns
-updated_at
-```
+## DB Representation Tokens
 
-If the same case is tested again, overwrite the existing result.
+Allowed tokens are `{"alignment":<int>}`, `<int>`, `<float>`, `<boolean>`, `<string>`, `<enum-int>`, and `<bitfield-int>`. Direct CCE arguments must all appear in `cce_args_json`; address arguments use only `{"alignment":<int>}`; extra controls must not use the alignment object; `<derived>` and `not stored` are not valid DB representations.
 
-## Environment Fields
+## CCE Args JSON
 
-`arch_version` and `soc_version` are plain text fields. The first version does
-not enforce enum values or naming rules.
-
-`device_id` is not stored.
-
-`cann_version` is not stored.
-
-## Signature
-
-`cce_name` must exactly match the `instruction` field in metadata.
-
-`signature` stores the complete CCE function signature string from metadata. It
-must exactly match one `overloads[].signature` value and is used directly to
-distinguish overloads.
-
-Database writers must copy the canonical metadata signature exactly. They should
-not reformat or re-canonicalize it during insertion.
+`cce_args_json` stores all direct CCE function arguments as one compact JSON
+list in complete signature order. Address arguments occupy their original
+positions and store only alignment information; real addresses, address spaces,
+offsets, and overlap information are not stored.
 
 Example:
 
-```text
-void copy_gm_to_ubuf(__ubuf__ void* dst, __gm__ void* src, uint8_t sid, uint16_t nBurst, uint16_t lenBurst, uint16_t srcStride, uint16_t dstStride);
-```
-
-## CCE Arguments
-
-`cce_args_json` stores all direct CCE function arguments as one list in complete
-signature declaration order.
-
-Address arguments occupy their original argument positions. For address
-arguments, store only alignment information. Do not store real addresses,
-address spaces, offsets, or overlap information.
-
-Address argument objects must use exactly this shape:
-
 ```json
-{"alignment": 32}
-```
-
-The only supported key is `alignment`, and its value must be an integer.
-
-For this declaration:
-
-```cpp
-void copy_gm_to_ubuf(__ubuf__ void* dst, __gm__ void* src, uint8_t sid, uint16_t nBurst, uint16_t lenBurst, uint16_t srcStride, uint16_t dstStride);
-```
-
-`cce_args_json` stores:
-
-```json
-[
-  {"alignment": 32},
-  {"alignment": 512},
-  0,
-  1,
-  32,
-  0,
-  0
-]
-```
-
-The list corresponds to:
-
-```text
-dst, src, sid, nBurst, lenBurst, srcStride, dstStride
+[{"alignment":32},{"alignment":512},0,1,32,0,0]
 ```
 
 For instructions without arguments:
@@ -134,17 +70,15 @@ For instructions without arguments:
 []
 ```
 
-## Extra Parameters
+## Extra Params JSON
 
 `extra_params_json` stores performance-relevant controls that are not direct CCE
-function parameters. The keys may differ between instructions.
+function parameters. Every key must be defined by the matching signature's
+`Extra Controls` section in `understanding.md`.
 
-For the first version, supported common keys are:
-
-- `l2_mode`: use `"use_l2"` or `"bypass_l2"`.
-- `set_mask`: use an integer value.
-
-If an instruction does not involve a given extra control, omit that key.
+Common first-version keys are `l2_mode` (`"use_l2"` or `"bypass_l2"`) and
+`set_mask` (integer). They are not an exhaustive global whitelist; confirmed
+instruction-specific keys are allowed.
 
 Examples:
 
@@ -153,82 +87,35 @@ Examples:
 ```
 
 ```json
-{
-  "l2_mode": "bypass_l2"
-}
+{"l2_mode":"bypass_l2"}
 ```
 
 ```json
-{
-  "set_mask": 128
-}
+{"set_mask":128}
 ```
 
 ```json
-{
-  "l2_mode": "use_l2",
-  "set_mask": 64
-}
+{"l2_mode":"use_l2","set_mask":64}
 ```
 
 ## JSON Canonicalization
 
-All JSON fields must be canonicalized before writing to SQLite. SQLite compares
-the JSON fields as text for uniqueness.
-
-Rules:
-
-- Use compact JSON without extra whitespace.
-- Sort object keys lexicographically.
-- Keep lists in their semantic order.
-- Store empty objects as `{}`.
-- Store empty lists as `[]`.
-- Keep numeric values as numbers, not strings.
-
-For `cce_args_json`, the list order must strictly follow the CCE function
-argument order in `signature`.
+SQLite compares JSON fields as text for uniqueness. Store compact JSON without
+extra whitespace, sort object keys lexicographically, keep lists in semantic
+order, store empty objects as `{}` and empty lists as `[]`, and keep numeric
+values as numbers.
 
 ## Result Fields
 
-`template_id` stores the test code template identifier used for the measurement.
-It should be a hash-like text value. It does not participate in case identity.
+`template_id` stores the test code template identifier and does not participate
+in case identity.
 
 `time_ns` stores the average time for one CCE instruction execution, in
-nanoseconds, rounded to one decimal place.
-
-When using `GetSystemCycle`, compute:
+nanoseconds, rounded to one decimal place:
 
 ```text
 time_ns = round((end_cycle - start_cycle) * 20.0 / iter, 1)
 ```
 
-`iter` is used to compute `time_ns`, but it is not stored.
-
-Do not store raw start cycles, end cycles, total cycles, per-iteration cycles,
-or `iter`.
-
-## Update Policy
-
-The database keeps only one result per unique case. Re-testing the same case
-should overwrite:
-
-```text
-template_id
-time_ns
-updated_at
-```
-
-Only successful measurements are stored. Failed cases are not inserted into the
-database.
-
-## Excluded Features
-
-The first database version does not include:
-
-- `device_id`.
-- `cann_version`.
-- `iter`.
-- failed case records.
-- raw start cycles, end cycles, total cycles, or per-iteration cycles.
-- schema migration or schema version tables.
-- extra query indexes beyond SQLite's automatically created unique index.
+`iter` is used only for this calculation. Raw cycles, per-iteration cycles,
+failed cases, and `iter` are not stored.

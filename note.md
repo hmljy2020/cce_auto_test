@@ -1,3 +1,5 @@
+*这里仅仅是框架开发过程中的记录，可能存在错误和未同步，不要被里面的信息误导*
+
 ## CCE Instruction 自动性能采集框架计划初稿
 项目构成：python脚本，结构化且指向清晰的markdown文件丛，c++代码模板，SQlite数据库
 功能描述：在该项目下启动Agent，并告诉Agent需要micro-benchmark的cce指令，Agent会开始长时间micro-benchmark，自动提出测试参数范围，分批micro-benchmark，建立和维护cce指令的性能`数据库`。
@@ -6,21 +8,24 @@
 ### cce指令文档
 Agent维护一个指导文档，文档储存着对cce指令的`理解`，包含两部分：
 1. 一个极其精简的metadata文件描述cce指令的函数形式，与`数据库`格式类似
-2. 一个.md文件描述更详细的入参含义，注意事项，参数限制 (TO DO, 2026.7.6)
+2. 一个.md文件描述更详细的入参语义、额外控制参数和DB表示形式
+
+*文档只负责指导Agent自主写出测试模板代码，参数的选取和限制放到`测试`环节中*
 
 文档内容的注意事项：
 - 同名指令可能存在多个重载，每个实现赋予一个签名（signature）
-- 涉及GM的搬运指令涉及L2 cache control的问题，在2201及以前的架构上没有cce入参的开关，而是靠虚拟地址映射完成，这时metadata和.md文件需要增加这个额外参数的语义，测试模板也需要特例化。
-- 复杂运算（如vdiv，vexp）的耗时可能会受到`set_mask`的影响，需要在metadata和.md文件需要增加这个额外参数的语义，测试模板也需要特例化。
+- 涉及GM的搬运指令可能涉及L2 cache control。若该控制影响case identity，应在`understanding.md`的`Extra Controls`中定义，例如`l2_mode`，并在数据库`extra_params_json`中表示；metadata不保存该控制项。
+- 复杂运算（如vdiv，vexp）的耗时可能会受到`set_mask`影响。若该控制影响case identity，应在`understanding.md`的`Extra Controls`中定义，并在数据库`extra_params_json`中表示；metadata不保存该控制项。
+- 测试阶段需要根据这些`Extra Controls`决定模板运行时输入、准备动作，或是否生成特化模板。
 - 其他在后续实验过程中发现的其他额外影响，需要以谨慎且合适的方式,在和用户确认后，补充到`理解`中。
 
 该指令文档是动态更新的，当Agent收到`micro-benchmark某个cce指令名称`的命令时：
 1. 查阅`cce_reference`下的内容，`理解`该cce指令，如果存在重载，向用户确认需要micro-benchmark哪个实现，给出推荐，确认signature。
 2. 检查`cce指令文档`中是否已经`理解`该signature的cce指令，如果
-    1. 已`理解`：参考`cce指令文档`，提出micro-benchmark参数范围，生成测试代码，储存测试结果到数据库
+    1. 已`理解`：参考`cce指令文档`中的参数语义和extra controls，在测试环节提出micro-benchmark参数范围，生成测试代码，储存测试结果到数据库
     2. 未`理解`：新增`理解`，严谨地向用户确认理解内容后，添加到`cce指令文档`中，跳转到`已理解`
 
-`cce_reference` path: /home/chao/microbenchmark/cce_reference
+`cce_reference` path: `cce_reference/`
 
 ### 测试模板代码
 #### kernel
@@ -30,7 +35,9 @@ template<Type srcType, Type dstType, ...>
 __global__ __aicore__ void benchmark(parameters...){
     // Some necessary preparation for cce parameters
     // Like addr offset for L2 bypass on arch 2201
+    if bypass_l2 {Helper::BypassL2(dst/src);};
     // Or set_mask, etc...
+    if mask!=0 {Helper::SetMask(mask);};
 
     // Warm up
     <cce>(parameters...);
@@ -48,7 +55,7 @@ __global__ __aicore__ void benchmark(parameters...){
 ```
 
 对于每一族cce指令，参考这个共同简易模板，特化这一族cce指令的模板以满足参数覆盖需求，比如：
-1. 涉及GM搬运的指令，需要考虑是否Bypass L2，在2201架构上需要在前期对GM地址加一个offset。
+1. 涉及GM搬运的指令，需要考虑是否Bypass L2，在2201架构上需要在前期对GM地址加一个offset。（写若干共用function？）
 
 对于要测试的cce指令，micro-benchmark的参数的作为变量传到kernel启动函数中（比如burst、burst_len等），一次编译，运行时input不同参数。变量可以是cce的直接入参，也可以是指导参数准备（比如2201架构上L2 Bypass的虚拟地址映射等）。
 
@@ -65,7 +72,9 @@ int main(){
     // micro-benchmark
     for (i=0; i<N_case; i++){
         benchmark_args = cases[i];
-        benchmark<<<1, nullptr, stream>>>(src_device, dst_device, benchmark_args...);
+        int8_t *dst = benchmark_args[0];
+        ...
+        benchmark<<<1, nullptr, stream>>>(src_device, dst_device, dst, src, ...);
     }
 }
 ```
@@ -79,11 +88,11 @@ host侧读取`input.?`，反复拉起kernel测试。
 1. arch version，SoC version，cce指令名称，signature
 2. addr
     - cce指令中的操作数地址src、dst
-    - addr不储存src和dst的具体值，储存alignment（地址对齐粒度），cache_mode（涉及GM时，是否bypass L2）
+    - addr不储存src和dst的具体值，只储存alignment（地址对齐粒度）
 3. cce指令控制参数
     - 直接按顺序储存成列表，后续可以对照`cce指令文档`按顺序确认参数含义
 4. 额外控制参数
-    - L2 Bypass等
+    - L2 Bypass、set_mask等影响case identity的控制项，写入`extra_params_json`
 
 数据储存的形式要尽可能简单
 
@@ -101,6 +110,10 @@ loop：
 4. 跳到1
 
 先确认metadata和数据库的准确格式
+
+### 自主分析
+控制变量法分析
+
 
 ---
 
@@ -195,6 +208,8 @@ CREATE TABLE measurements (
 - `l2_mode`：只允许`"use_l2"`或`"bypass_l2"`；不涉及时省略。
 - `set_mask`：整数；不涉及时省略。
 
+`l2_mode`和`set_mask`是第一版常见key，不是全局穷尽白名单。instruction-specific key只有在该signature的`understanding.md` / `Extra Controls`中定义，并经用户确认后才允许使用。对某个被测试signature，`extra_params_json`中的每个key都必须由该signature的`Extra Controls`定义。
+
 所有JSON字段写入SQLite前必须canonicalize：
 - compact JSON，不写多余空格。
 - object key按字典序排序。
@@ -217,3 +232,153 @@ time_ns = round((end_cycle - start_cycle) * 20.0 / iter, 1)
 - start/end cycle、total cycle、per-iteration cycle
 - schema version / migration表
 - 额外查询索引
+
+## 已确认：understanding.md格式
+
+`cce_docs`采用目录式组织，每个指令一个目录：
+```text
+cce_docs/
+  <instruction>/
+    metadata.draft.json
+    understanding.draft.md
+    metadata.json
+    understanding.md
+```
+
+`*.draft.*`用于Agent整理或等待用户确认。正式测试只读取`metadata.json`和`understanding.md`；smoke可以使用draft文件，但smoke结果不入正式数据库。
+
+draft文件名和overload status是两套概念。smoke可以读取`metadata.draft.json`和`understanding.draft.md`，但被测试的overload仍必须是`approved_smoke`或`approved_sweep`。`status=draft`的overload不能用于smoke或正式测试。
+
+`understanding.md`是该指令的人类确认语义文档，不重复metadata和数据库schema。metadata是signature和approval status的唯一事实源；database README是入库格式的唯一事实源；`understanding.md`只保存CCE直接入参语义、额外控制参数、DB表示形式和来源。
+
+`cce_docs`只用于写明该CCE指令的入参和其他控制参数，指导Agent自主写出测试模板代码。参数选取、baseline cases、sweep范围、coverage、测试约束和测量策略放到后续`测试`环节，不写入`understanding.md`。
+
+固定结构：
+```markdown
+# <instruction> Understanding
+
+## Signature: `<canonical signature from metadata>`
+
+### Signature Overview
+### Parameters
+### Extra Controls
+### Sources
+```
+
+如果一个instruction有多个重载，每个重载使用一个独立的`## Signature:`章节。顶层只保留标题，不设置全局章节。章节标题必须逐字等于`metadata.overloads[].signature`，单行，保留结尾`;`，并用Markdown inline code包裹。
+
+第一版不设置`Document Status`、`Instruction Overview`、`Baseline Cases`、`Available Templates`、`Reference Templates`、`Template Requirements`、`Measurement Notes`、`Risks And Unknowns`、`Coverage Space`、`Template Guidance`、`Architecture Notes`章节，也不在signature章节中重复approval status。
+
+不写入：
+- `metadata_version`
+- metadata overload status完整列表
+- `signature_id`、signature hash或派生参数列表
+- 数据库schema
+- baseline case、测试值、sweep范围、coverage策略
+- 模板实现细节
+- 文档review状态
+- 每个signature的approval status
+
+### Signature Overview
+
+只写1到2句短说明：该signature做什么。不写“本文档描述什么”、参数表、测试计划、metadata字段或数据库schema。
+
+示例：
+```markdown
+### Signature Overview
+
+`copy_gm_to_ubuf` copies data from a GM source operand to a UB destination operand.
+```
+
+### Parameters
+
+固定表格：
+```markdown
+| Order | Name | Type | Role | Unit | DB Representation | Notes |
+|---:|---|---|---|---|---|---|
+| 0 | dst | `__ubuf__ void*` | address:dst:UB | bytes | `{"alignment":<int>}` | Real address is allocated by the template. |
+```
+
+`Order`严格按照signature入参顺序，从0开始。`Name`和`Type`与canonical signature对齐。`Parameters`表必须对signature中的每一个CCE直接入参写且只写一行，不能省略、增加或重排。
+
+`Notes`可以写生成正确模板代码所需的参数语义和语义合法性约束，不写测试取值、baseline取值、sweep范围、coverage hint或推荐测试值。
+
+第一版`Role`允许值：
+- `address:src:GM`
+- `address:dst:GM`
+- `address:src:UB`
+- `address:dst:UB`
+- `address:src:L1`
+- `address:dst:L1`
+- `scalar`
+- `length`
+- `stride`
+- `repeat`
+- `config`
+- `enum`
+- `immediate`
+- `derived`
+- `unknown`
+
+第一版`Unit`允许值：
+- `none`
+- `bytes`
+- `elements`
+- `blocks`
+- `bits`
+- `boolean`
+- `enum`
+- `unknown`
+- `instruction-specific:<name>`
+
+`Unit`描述取值单位，不描述参数角色。例如repeat参数通常是`Role=repeat`且`Unit=none`。
+
+第一版`DB Representation`允许值：
+- `{"alignment":<int>}`
+- `<int>`
+- `<float>`
+- `<boolean>`
+- `<string>`
+- `<enum-int>`
+- `<bitfield-int>`
+
+CCE地址参数只能写`{"alignment":<int>}`。每个CCE直接入参都必须有清晰的DB表示，因为每个直接入参都会占据`cce_args_json`中的原始位置。如果某个值由命名字段或模板逻辑生成，`DB Representation`仍写最终入库表示，并在`Notes`解释生成关系。
+
+如果必要的参数语义未知，在对应行写`unknown`或`TBD`，并在`Notes`解释。若必要的参数/control语义仍未知，metadata overload status保持`draft`，直到用户确认该未知项是否允许smoke或sweep。
+
+### Extra Controls
+
+该章节定义`extra_params_json`的可选key：不是CCE直接入参、会影响benchmark case identity、并且会存入`extra_params_json`的控制项。
+
+固定表格：
+```markdown
+| Name | Values | DB Key | DB Representation | Notes |
+|---|---|---|---|---|
+| l2_mode | `use_l2`, `bypass_l2` | `l2_mode` | `<string>` | Controls L2 behavior for GM-related access when applicable. |
+```
+
+如果没有额外控制项，写：
+```markdown
+None.
+```
+
+`DB Key`必须逐字等于`extra_params_json`中的key。不会进入`extra_params_json`的模板内部变量不写入该表。如果发现某性能相关控制项无法入库，必须保持metadata overload status为`draft`，直到用户确认case identity如何表示。如果`Values`为`TBD`，也必须保持metadata overload status为`draft`，直到取值形态足够清晰，可以稳定生成`extra_params_json`。
+
+第一版`Extra Controls`的`DB Representation`允许值：
+- `<int>`
+- `<float>`
+- `<boolean>`
+- `<string>`
+- `<enum-int>`
+- `<bitfield-int>`
+
+### Sources
+
+`Sources`放在每个signature章节内，不做文档全局source。使用短列表，不再使用表格。
+
+```markdown
+- `cce_reference/stub_fun.h`: signature only.
+- user confirmation `2026-07-08`: confirms parameter roles and extra controls.
+```
+
+每个signature至少一条source。`stub_fun.h`只能证明signature，不能证明参数语义。用户确认可以作为source。
